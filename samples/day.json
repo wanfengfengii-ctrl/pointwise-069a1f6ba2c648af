@@ -1,0 +1,13 @@
+{
+  "batch": "批-01",
+  "shift": "早班",
+  "samples": [
+    {"slot": "A", "value": 7, "position": "光谱台/01"},
+    {"slot": "B", "value": 11, "position": "光谱台/02"},
+    {"slot": "C", "value": 13, "position": "光谱台/03"}
+  ],
+  "orders": [
+    {"order_id": "X", "slots": ["A", "B"]},
+    {"order_id": "Y", "slots": ["B", "C"]}
+  ]
+}
