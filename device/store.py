@@ -92,6 +92,16 @@ class DeviceStore:
             raise KeyError(key)
         return row['takes']
 
+    def sample_available(self, batch, slot):
+        """Return True when a loaded sample is still physically untaken."""
+        key = validate_slot_key(batch, slot)
+        self.require_available('count', key.slot)
+        row = self.db.execute(
+            '''SELECT taken_by, value FROM device_slots
+               WHERE batch = ? AND slot = ?''', (key.batch, key.slot),
+        ).fetchone()
+        return row is not None and row['taken_by'] is None and row['value'] is not None
+
 
 def open_device_store(path):
     return DeviceStore(path)

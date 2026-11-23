@@ -9,3 +9,7 @@ from device.store import open_device_store as open_device_store
 from device.take import DeviceReceipt as DeviceReceipt
 from device.take import ReceiptConfirmed as ReceiptConfirmed
 from device.take import take as take
+
+
+def sample_available(store, batch, slot):
+    return store.sample_available(batch, slot)

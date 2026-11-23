@@ -4,6 +4,7 @@ from issuance.eligibility import evaluate_eligibility
 from issuance.measure import measure_total
 from issuance.receipts import make_issue_receipt
 from issuance.store import IssuedResult, commit_result, load_by_order
+from orders.batches import require_text
 from orders.manifests import get_manifest
 
 
@@ -14,6 +15,9 @@ class IssuePending:
 
 
 def issue(station, order_id):
+    order_id = require_text(order_id, 'order id')
+    if order_id.startswith('@retest:'):
+        raise ValueError('retest capture orders are signed through settle_retests')
     manifest = get_manifest(station, order_id)
     existing = load_by_order(station, order_id)
     if existing is not None:

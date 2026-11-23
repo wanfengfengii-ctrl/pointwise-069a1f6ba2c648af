@@ -8,7 +8,29 @@ from tempfile import TemporaryDirectory
 from capture.actions import SCHEMA as ACTION_SCHEMA
 from capture.dispatch import dispatch_take
 from capture.evidence import SCHEMA as EVIDENCE_SCHEMA
+from capture.evidence import get_evidence
+from capture.locks import SCHEMA as LOCK_SCHEMA
+from capture.locks import SampleLocked, is_locked
 from capture.resume import resume
+from capture.retests import SCHEMA as RETEST_SCHEMA
+from capture.retests import (
+    RetestCandidate,
+    RetestPlan,
+    RetestReconciliation,
+    RetestRefused,
+    RetestRequirement,
+    RetestResult,
+    RetestResume,
+    RetestSettlement,
+    get_retest_plan,
+    list_retests_by_shift,
+    load_retest_by_order,
+    plan_retests,
+    read_retest,
+    reconcile_retest,
+    resume_retest,
+    settle_retests,
+)
 from device import DeviceUnavailable, load, open_device_store, source_receipt
 from history import export_sources, list_shift_results, read, reconcile
 from issuance import IssuePending, IssuedResult, issue, load_by_order
@@ -37,7 +59,10 @@ class Station:
         self._rejected_commits = set()
         try:
             self.db.execute('PRAGMA foreign_keys = ON')
-            schemas = (BATCH_SCHEMA, SLOT_SCHEMA, MANIFEST_SCHEMA, ACTION_SCHEMA, EVIDENCE_SCHEMA, RESULT_SCHEMA)
+            schemas = (
+                BATCH_SCHEMA, SLOT_SCHEMA, MANIFEST_SCHEMA, ACTION_SCHEMA, EVIDENCE_SCHEMA,
+                RESULT_SCHEMA, LOCK_SCHEMA, RETEST_SCHEMA,
+            )
             self.db.executescript('BEGIN IMMEDIATE;\n' + '\n'.join(schemas) + '\nCOMMIT;')
         except BaseException:
             self.close()
@@ -59,7 +84,7 @@ class Station:
         return self.device
 
     def reject_next_commit(self, stage):
-        if stage not in ('dispatch', 'adopt', 'release', 'issue'):
+        if stage not in ('dispatch', 'adopt', 'release', 'issue', 'plan', 'settle'):
             raise ValueError(f'unknown station commit stage {stage!r}')
         self._rejected_commits.add(stage)
 
@@ -97,8 +122,8 @@ class Station:
         manifest = get_manifest(self, order_id)
         return dispatch_take(self, manifest, manifest.slots, action_id)
 
-    def resume(self, order_id):
-        return resume(self, order_id)
+    def resume(self, order_id, action_id=None):
+        return resume(self, order_id, action_id)
 
     def issue(self, order_id):
         return issue(self, order_id)
@@ -118,6 +143,30 @@ class Station:
     def reconcile(self, shift, result_id):
         return reconcile(self, shift, result_id)
 
+    def plan_retests(self, requirements, candidates, budget, plan_id=None):
+        return plan_retests(self, requirements, candidates, budget, plan_id)
+
+    def retest_plan(self, plan_id):
+        return get_retest_plan(self, plan_id)
+
+    def resume_retest(self, plan_id, action_id=None):
+        return resume_retest(self, plan_id, action_id)
+
+    def settle_retests(self, plan_id):
+        return settle_retests(self, plan_id)
+
+    def retest_for(self, order_id):
+        return load_retest_by_order(self, order_id)
+
+    def read_retest(self, result_id):
+        return read_retest(self, result_id)
+
+    def list_shift_retests(self, shift):
+        return list_retests_by_shift(self, shift)
+
+    def reconcile_retest(self, shift, result_id):
+        return reconcile_retest(self, shift, result_id)
+
 
 def initialize(station, data):
     batch = data['batch']
@@ -134,6 +183,120 @@ def _result_details(result):
         'slots': [line.slot for line in result.lines],
         'values': [line.value for line in result.lines],
         'total': result.total,
+    }
+
+
+def _retest_demo(directory, data):
+    batch = '复验批'
+    samples = (
+        ('P', 5, '光谱台/21'), ('Q', 6, '光谱台/22'),
+        ('X', 70, '光谱台/31'), ('Y', 80, '光谱台/32'), ('Z', 90, '光谱台/33'),
+    )
+    shared = (('X', ('甲',), 2), ('Y', ('乙',), 3), ('Z', ('甲', '乙'), 4))
+    requirements = (('甲', 1), ('乙', 1))
+    station_path = Path(directory) / 'retest.sqlite'
+    with open_device_store(Path(directory) / 'retest-device.sqlite') as device:
+        with Station(station_path, device, shift=data['shift']) as desk:
+            desk.register_batch(batch)
+            desk.register_slots(batch, tuple(slot for slot, _, _ in samples))
+            for slot, value, position in samples:
+                desk.load_sample(batch, slot, value, position)
+            originals = {}
+            for order_id, slot in (('甲', 'P'), ('乙', 'Q')):
+                desk.order(order_id, batch, (slot,))
+                desk.resume(order_id)
+                originals[order_id] = desk.issue(order_id)
+            try:
+                desk.plan_retests(requirements, shared[:2], 4)
+            except RetestRefused as refused:
+                greedy_refused = set(refused.pending) == {'甲', '乙'}
+            else:
+                raise AssertionError('a cheapest-first greedy plan should be refused')
+            plan = desk.plan_retests(requirements, shared, 4)
+            if plan.slots != ('Z',) or plan.total_cost != 4:
+                raise AssertionError('retest plan did not choose the shared Z slot')
+            desk.order('丙', batch, ('X', 'Z'))
+            competition = desk.resume('丙')
+            z_evidence_after_competition = get_evidence(desk, batch, 'Z')
+            if competition.pending != ('Z',) or z_evidence_after_competition is not None:
+                raise AssertionError('ordinary capture must not take a locked retained slot')
+            device.drop_replies.add(('take', 'rt-z'))
+            first = desk.resume_retest(plan.plan_id, 'rt-z')
+            lock_after_lost_reply = is_locked(desk, batch, 'Z')
+            if not lock_after_lost_reply:
+                raise AssertionError('an uncertain retest take must keep the retained sample locked')
+            second = desk.resume_retest(plan.plan_id, 'rt-z')
+            lock_before_settlement = is_locked(desk, batch, 'Z')
+            if second.pending or not lock_before_settlement:
+                raise AssertionError('retest evidence did not settle under the same lock')
+            settlement = desk.settle_retests(plan.plan_id)
+            lock_after_settlement = is_locked(desk, batch, 'Z')
+            takes = device.taken_count(batch, 'Z')
+            confirmed = source_receipt(device, 'rt-z').status
+        with Station(station_path, shift='晚班') as audit:
+            by_order = {result.order_id: result for result in settlement.results}
+            audits = tuple(
+                audit.reconcile_retest(data['shift'], by_order[order_id].result_id)
+                for order_id in ('甲', '乙')
+            )
+            z_source = audits[0].sources[0]
+            retest_downstream = {
+                'totals': [entry.total for entry in audits],
+                'same_source': audits[0].sources[0] == audits[1].sources[0],
+                'source': [z_source.source_slot, z_source.position, z_source.action_id,
+                           z_source.device_receipt_id],
+                'z_takes': takes, 'device_receipt': confirmed,
+                'locks_released': not lock_after_settlement,
+                'originals_intact': [
+                    audit.result_for(order_id) == originals[order_id] for order_id in ('甲', '乙')
+                ],
+            }
+            for order_id in ('甲', '乙'):
+                original = originals[order_id]
+                if by_order[order_id].original_result_id != original.result_id:
+                    raise AssertionError(f'retest did not link the original result of {order_id!r}')
+                if by_order[order_id].original_receipt_id != original.receipt.receipt_id:
+                    raise AssertionError(f'retest did not keep the original first receipt of {order_id!r}')
+            if retest_downstream != {
+                'totals': [90, 90], 'same_source': True,
+                'source': ['Z', '光谱台/33', 'rt-z', 'device:rt-z'],
+                'z_takes': 1, 'device_receipt': 'confirmed',
+                'locks_released': True, 'originals_intact': [True, True],
+            }:
+                raise AssertionError('retest handoff disagrees with physical sampling')
+    return {
+        'case_id': 'v8',
+        'input': {
+            'requirements': {'甲': 1, '乙': 1},
+            'candidates': [[slot, list(orders), cost] for slot, orders, cost in shared],
+            'budget': 4, 'lost_reply_action': 'rt-z',
+        },
+        'expected': {'slots': ['Z'], 'total_cost': 4},
+        'actual': {'slots': list(plan.slots), 'total_cost': plan.total_cost},
+        'greedy_refused': greedy_refused,
+        'competition': {
+            'pending': list(competition.pending),
+            'z_evidence_after_resume': z_evidence_after_competition,
+        },
+        'retest': {
+            'lost_reply_pending': list(first.pending),
+            'retry_actions': list(first.retry_actions),
+            'lock_after_lost_reply': lock_after_lost_reply,
+            'resumed_pending': list(second.pending),
+            'lock_before_settlement': lock_before_settlement,
+            'results': {order_id: _result_details(by_order[order_id]) for order_id in ('甲', '乙')},
+        },
+        'downstream_expected': {
+            'totals': [90, 90], 'same_source': True,
+            'source': ['Z', '光谱台/33', 'rt-z', 'device:rt-z'],
+            'z_takes': 1, 'device_receipt': 'confirmed',
+            'locks_released': True, 'originals_intact': [True, True],
+        },
+        'downstream_actual': retest_downstream,
+        'code_paths': ['capture/retests.py', 'capture/locks.py', 'capture/resume.py',
+                       'device/take.py', 'issuance/measure.py'],
+        'oracle': '两单各需一槽：甲单 X 成本 2、乙单 Y 成本 3、共享 Z 成本 4，额度 4 只取 Z；'
+                  'Z 实取一次、回执确认一次、两单复验成果同源，留样锁在销账后释放。',
     }
 
 
@@ -189,6 +352,7 @@ def demo():
             }
             if downstream != expected_handoff:
                 raise AssertionError('SHARED_SAMPLE_INCOMPLETE: offline handoff disagrees with physical sampling')
+        retest_scenario = _retest_demo(directory, data)
     scenario = {
         'case_id': 'v7',
         'input': {'fixture': data, 'lost_reply': 'x', 'lookup_paused_during_first_Y_resume': True},
@@ -198,6 +362,7 @@ def demo():
         'oracle': '固定样例手算 11+13=24 和 7+11=18，并对照 B 的固定物理位置、动作、回执及一次实取计数。',
     }
     print('POINTWISE_SCENARIO ' + json.dumps(scenario, ensure_ascii=False))
+    print('POINTWISE_SCENARIO ' + json.dumps(retest_scenario, ensure_ascii=False))
 
 
 def main():

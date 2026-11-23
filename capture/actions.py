@@ -1,6 +1,7 @@
 import json
 from dataclasses import dataclass
 
+from capture.locks import require_unlocked
 from orders.batches import require_text
 from orders.slots import slot_names
 
@@ -50,6 +51,9 @@ def record_intent(station, manifest, slots, action_id=None):
     if not set(planned).issubset(manifest.slots):
         raise ValueError('capture action is outside its initiating manifest')
     with station.write('dispatch'):
+        # Re-check inside the write transaction so a concurrent retest plan
+        # cannot lock a retained slot between the caller's check and this write.
+        require_unlocked(station, manifest.order_id, manifest.batch, planned)
         if action_id is None:
             sequence = station.db.execute(
                 'SELECT COALESCE(MAX(sequence), 0) + 1 FROM capture_actions'

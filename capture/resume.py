@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from capture.actions import find_unsettled_actions
 from capture.dispatch import dispatch_take, send_intent
 from capture.evidence import get_evidence, persist_receipt
+from capture.locks import foreign_locked_slots
 from capture.receipts import validate_receipt
 from capture.settlement import release_receipt
 from device.recover import source_receipt
@@ -54,11 +55,15 @@ def _recover(station, intent):
     return True
 
 
-def resume(station, order_id):
+def resume(station, order_id, action_id=None):
     manifest = get_manifest(station, order_id)
     retry = []
     unresolved_own_slots = set()
     for intent in find_unsettled_actions(station, manifest.batch, manifest.slots):
+        # Another plan's locked retained slots may only be settled through that
+        # plan's own capture order, never through an ordinary order's resume.
+        if foreign_locked_slots(station, order_id, intent.batch, intent.slots):
+            continue
         try:
             complete = _recover(station, intent)
         except DeviceUnavailable:
@@ -70,9 +75,14 @@ def resume(station, order_id):
 
     # Other orders' uncertain actions do not reserve these slots. Positive
     # device evidence decides which action actually took an overlapping slot.
-    remaining = tuple(slot for slot in _missing(station, manifest) if slot not in unresolved_own_slots)
+    # Slots reserved for a retest stay pending for ordinary capture.
+    locked = foreign_locked_slots(station, order_id, manifest.batch, manifest.slots)
+    remaining = tuple(
+        slot for slot in _missing(station, manifest)
+        if slot not in unresolved_own_slots and slot not in locked
+    )
     if remaining:
-        outcome = dispatch_take(station, manifest, remaining)
+        outcome = dispatch_take(station, manifest, remaining, action_id)
         try:
             complete = _complete_dispatch(station, outcome)
         except DeviceUnavailable:
